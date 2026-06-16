@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -104,6 +105,34 @@ class Metrics:
 
 
 metrics = Metrics()
+
+class InjectedFaults:
+    """In-process fault state toggled by the /admin endpoints (see app.py)
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self.latency_ms = 0
+        self.fail_rate = 0.0
+
+    def set(self, latency_ms: int | None = None, fail_rate: float | None = None) -> None:
+        with self._lock:
+            if latency_ms is not None:
+                self.latency_ms = max(0, int(latency_ms))
+            if fail_rate is not None:
+                self.fail_rate = min(1.0, max(0.0, float(fail_rate)))
+
+    def clear(self) -> None:
+        with self._lock:
+            self.latency_ms = 0
+            self.fail_rate = 0.0
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"latency_ms": self.latency_ms, "fail_rate": self.fail_rate}
+
+
+injected = InjectedFaults()
 
 
 class TelemetryMiddleware(BaseHTTPMiddleware):
