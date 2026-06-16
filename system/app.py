@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from psycopg2 import pool as pgpool
 from pydantic import BaseModel
 
-from telemetry import TelemetryMiddleware, log, metrics
+from telemetry import TelemetryMiddleware, injected, log, metrics
 
 DB_DSN = os.environ.get(
     "DATABASE_URL", "postgresql://sre:sre@postgres:5432/sre"
@@ -143,6 +143,30 @@ def get_item(item_id: int) -> dict:
     get_redis().setex(f"item:{item_id}", CACHE_TTL_S, name)
     return {"id": item_id, "name": name, "source": "db"}
 
+class InjectIn(BaseModel):
+    latency_ms: int | None = None
+    fail_rate: float | None = None
+
+
+@app.post("/admin/inject")
+def admin_inject(spec: InjectIn) -> dict:
+    """Fault-injection seam: toggle in-process faults the middleware applies."""
+    injected.set(latency_ms=spec.latency_ms, fail_rate=spec.fail_rate)
+    state = injected.snapshot()
+    log.warning("fault_injected", extra=state)
+    return state
+
+
+@app.post("/admin/clear")
+def admin_clear() -> dict:
+    injected.clear()
+    log.warning("fault_cleared")
+    return injected.snapshot()
+
+
+@app.get("/admin/state")
+def admin_state() -> dict:
+    return injected.snapshot()
 
 @app.get("/work")
 def work(fail_rate: float = 0.0, delay_ms: int = 0) -> dict:
