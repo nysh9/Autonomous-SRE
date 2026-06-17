@@ -1,0 +1,50 @@
+
+- id: service_crash
+  name: App container crash
+  type: container
+  benign: false
+  symptom: >-
+    App is unreachable: connections to :8000 refused, health probe fails, callers
+    see 502/connection errors.
+  root_cause: The app container is not running (it crashed or was stopped).
+  correct_fix: Restart the app container (docker compose start app / restart the service).
+  detect_signals:
+    - app container status is not "running"
+    - connection refused on http://localhost:8000
+  inject: {action: stop_container, service: app}
+  clear: {action: start_container, service: app}
+
+- id: database_down
+  name: Postgres unreachable
+  type: container
+  benign: false
+  symptom: >-
+    /health reports postgres:false and returns 503; endpoints that read/write the
+    DB (/items) return 5xx with connection errors. Redis-cached reads may still work.
+  root_cause: The Postgres container is down, so the app cannot open DB connections.
+  correct_fix: Restart the Postgres container and confirm the app reconnects.
+  detect_signals:
+    - postgres container status is not "running"
+    - /health checks.postgres == false
+    - DB connection errors in app logs
+  inject: {action: stop_container, service: postgres}
+  clear: {action: start_container, service: postgres}
+
+- id: latency_injection
+  name: Elevated request latency
+  type: app
+  benign: false
+  symptom: >-
+    p99 (and p50) request latency spikes well above baseline across endpoints;
+    callers see slow responses / timeouts. Error rate stays low; dependencies are up.
+  root_cause: >-
+    Injected per-request latency in the app (simulating a slow dependency / GC
+    pause), not a crash or dependency outage.
+  correct_fix: >-
+    Remove the injected latency (clear the fault); in a real system, identify and
+    fix the slow code path or dependency.
+  detect_signals:
+    - /metrics p99_latency_ms far above baseline
+    - dependencies still healthy, error_rate near zero
+  inject: {action: admin_inject, payload: {latency_ms: 800}}
+  clear: {action: admin_clear}
