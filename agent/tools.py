@@ -116,7 +116,6 @@ def check_health(service=None):
     return {"ok": True, "services": results}
 
 
-# config keys worth surfacing — the stuff a bad-deploy fault actually touches
 CONFIG_PREFIXES = ("DATABASE_URL", "REDIS_URL", "DB_POOL", "CACHE_TTL", "POSTGRES_", "SYSTEM_")
 
 
