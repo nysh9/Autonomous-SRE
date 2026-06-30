@@ -7,7 +7,7 @@ from pathlib import Path
 
 import docker
 
-PROJECT = os.environ.get("COMPOSE_PROJECT", "sre")
+PROJECT = os.environ.get("COMPOSE_PROJECT", "autonomoussre")
 
 
 def _resolve_docker_host() -> str | None:

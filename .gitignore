@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Env / secrets
+.env
+
+# OS
+.DS_Store
+
+# Eval artifacts (keep results.md tracked; ignore scratch)
+eval/_runs/
