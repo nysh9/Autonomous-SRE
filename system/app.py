@@ -67,6 +67,11 @@ def startup() -> None:
                         "(id SERIAL PRIMARY KEY, name TEXT NOT NULL)"
                     )
                 conn.commit()
+            metrics.set_dep("postgres", True)
+            try:
+                metrics.set_dep("redis", bool(get_redis().ping()))
+            except Exception:  # noqa: BLE001
+                metrics.set_dep("redis", False)
             log.info("startup_db_ready", extra={"attempt": attempt})
             break
         except Exception as exc:  # noqa: BLE001 — startup wants to keep retrying

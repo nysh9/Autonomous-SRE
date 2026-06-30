@@ -136,11 +136,18 @@ injected = InjectedFaults()
 
 
 class TelemetryMiddleware(BaseHTTPMiddleware):
-    """Time every request, count errors (5xx or raised), emit a JSON access log."""
+    """Time every request, count errors (5xx or raised), emit a JSON access log.
+
+    Also applies injected faults (added latency) so they show up in real latency
+    metrics and logs, exactly as a slow dependency would.
+    """
 
     async def dispatch(self, request: Request, call_next):
         start = time.perf_counter()
         status = 500
+        fault = injected.snapshot()
+        if fault["latency_ms"] and request.url.path not in ("/metrics", "/admin/clear"):
+            await asyncio.sleep(fault["latency_ms"] / 1000.0)
         try:
             response = await call_next(request)
             status = response.status_code
@@ -148,6 +155,7 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         finally:
             latency_ms = (time.perf_counter() - start) * 1000.0
             is_error = status >= 500
+            # Skip self-instrumentation noise from the agent polling /metrics.
             if request.url.path != "/metrics":
                 metrics.record(latency_ms, is_error)
                 log.info(
