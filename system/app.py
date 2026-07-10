@@ -173,6 +173,15 @@ def admin_clear() -> dict:
 def admin_state() -> dict:
     return injected.snapshot()
 
+
+@app.post("/admin/reset")
+def admin_reset() -> dict:
+    """Clear injected faults + metric windows so a fresh scenario starts clean."""
+    injected.clear()
+    metrics.reset()
+    log.warning("metrics_reset")
+    return {"reset": True}
+
 @app.get("/work")
 def work(fail_rate: float = 0.0, delay_ms: int = 0) -> dict:
     """Synthetic workload + a seam for later error-rate / latency faults."""

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import sys
 import time
 from collections import deque
@@ -15,6 +16,11 @@ from threading import Lock
 import psutil
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+# fail_rate is injected on business endpoints only — never on the agent's probes,
+# so /health and /metrics stay truthful and /admin stays reachable to clear it.
+FAIL_EXCLUDED = ("/metrics", "/health", "/admin")
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -58,9 +64,11 @@ log = get_logger()
 class Metrics:
     """Thread-safe counters + a rolling window of latencies for percentiles."""
 
-    def __init__(self, window: int = 500) -> None:
+    def __init__(self, window: int = 200) -> None:
         self._lock = Lock()
         self._latencies: deque[float] = deque(maxlen=window)
+        # Windowed outcomes so error_rate reflects RECENT state, not all-time.
+        self._errors: deque[bool] = deque(maxlen=window)
         self.request_count = 0
         self.error_count = 0
         self.started_at = time.time()
@@ -69,6 +77,7 @@ class Metrics:
     def record(self, latency_ms: float, is_error: bool) -> None:
         with self._lock:
             self._latencies.append(latency_ms)
+            self._errors.append(is_error)
             self.request_count += 1
             if is_error:
                 self.error_count += 1
@@ -76,6 +85,14 @@ class Metrics:
     def set_dep(self, name: str, up: bool) -> None:
         with self._lock:
             self.deps[name] = up
+
+    def reset(self) -> None:
+        """Clear the rolling windows + counters (used to isolate eval scenarios)."""
+        with self._lock:
+            self._latencies.clear()
+            self._errors.clear()
+            self.request_count = 0
+            self.error_count = 0
 
     @staticmethod
     def _percentile(values: list[float], pct: float) -> float:
@@ -88,6 +105,7 @@ class Metrics:
     def snapshot(self) -> dict:
         with self._lock:
             lat = list(self._latencies)
+            errs = list(self._errors)
             req = self.request_count
             err = self.error_count
             deps = dict(self.deps)
@@ -95,7 +113,7 @@ class Metrics:
         return {
             "request_count": req,
             "error_count": err,
-            "error_rate": round(err / req, 4) if req else 0.0,
+            "error_rate": round(sum(errs) / len(errs), 4) if errs else 0.0,
             "p50_latency_ms": self._percentile(lat, 50),
             "p99_latency_ms": self._percentile(lat, 99),
             "memory_rss_mb": round(psutil.Process().memory_info().rss / 1_048_576, 1),
@@ -148,8 +166,16 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         fault = injected.snapshot()
         if fault["latency_ms"] and request.url.path not in ("/metrics", "/admin/clear"):
             await asyncio.sleep(fault["latency_ms"] / 1000.0)
+        inject_error = (
+            fault["fail_rate"]
+            and not request.url.path.startswith(FAIL_EXCLUDED)
+            and random.random() < fault["fail_rate"]
+        )
         try:
-            response = await call_next(request)
+            if inject_error:
+                response = JSONResponse(status_code=500, content={"detail": "injected failure"})
+            else:
+                response = await call_next(request)
             status = response.status_code
             return response
         finally:

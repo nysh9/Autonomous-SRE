@@ -140,6 +140,12 @@ class MockModel:
             return {"incident": True, "root_cause": "Elevated request latency (slow path / injected delay).",
                     "recommended_fix": "Remove the injected latency or fix the slow dependency.",
                     "confidence": "medium", "evidence": [f"p99 latency {p99}ms far above baseline"]}
+        # All containers are up by this point, so high errors mean the app itself is failing.
+        err = metrics.get("error_rate", 0)
+        if err and err > 0.2:
+            return {"incident": True, "root_cause": "The app is failing a portion of requests (bad code path / deploy), not a dependency outage.",
+                    "recommended_fix": "Roll back or fix the failing endpoint.", "confidence": "medium",
+                    "evidence": [f"error_rate {err} well above baseline", "all dependencies healthy"]}
         return {"incident": False, "root_cause": "No fault detected; all services healthy.",
                 "recommended_fix": "No action needed.", "confidence": "medium",
                 "evidence": ["all containers running", "error rate near zero"]}

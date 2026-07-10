@@ -48,3 +48,39 @@
     - dependencies still healthy, error_rate near zero
   inject: {action: admin_inject, payload: {latency_ms: 800}}
   clear: {action: admin_clear}
+
+- id: cache_down
+  name: Redis unreachable
+  type: container
+  benign: false
+  symptom: >-
+    /health reports redis:false and returns 503; endpoints that use the cache
+    (/items) error out. Postgres stays up, so the outage is isolated to the cache.
+  root_cause: The Redis container is down, so the app cannot reach the cache.
+  correct_fix: Restart the Redis container and confirm the app reconnects.
+  detect_signals:
+    - redis container status is not "running"
+    - /health checks.redis == false
+    - cache/connection errors in app logs
+  inject: {action: stop_container, service: redis}
+  clear: {action: start_container, service: redis}
+
+- id: error_rate_spike
+  name: Elevated error rate
+  type: app
+  benign: false
+  symptom: >-
+    A significant fraction of requests return 5xx; /metrics error_rate climbs well
+    above zero. Dependencies stay healthy and latency is normal — the app itself is
+    failing requests.
+  root_cause: >-
+    The app is throwing errors on a portion of requests (bad deploy / failing code
+    path), not a dependency outage.
+  correct_fix: >-
+    Roll back or fix the failing endpoint (clear the injected failure); dependencies
+    need no action.
+  detect_signals:
+    - /metrics error_rate well above baseline
+    - dependencies still healthy, latency normal
+  inject: {action: admin_inject, payload: {fail_rate: 0.5}}
+  clear: {action: admin_clear}
