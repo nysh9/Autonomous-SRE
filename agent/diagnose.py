@@ -16,7 +16,7 @@ from agent.tools import TOOL_SCHEMAS, call_tool
 
 load_dotenv()
 
-DIAGNOSE_MODEL = os.environ.get("DIAGNOSE_MODEL", "claude-sonnet-4-6")
+DIAGNOSE_MODEL = os.environ.get("DIAGNOSE_MODEL", "claude-sonnet-5")
 TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "claude-haiku-4-5-20251001")
 MAX_STEPS = 8
 
@@ -95,13 +95,19 @@ class LLMResponse:
 class AnthropicModel:
     def __init__(self):
         import anthropic
-        self.client = anthropic.Anthropic()
+        self._anthropic = anthropic
+        # SDK retries transient errors (429/5xx/overloaded/connection) with backoff.
+        self.client = anthropic.Anthropic(timeout=30.0, max_retries=2)
 
     def complete(self, system, messages, tools, model, tool_choice=None) -> LLMResponse:
         kwargs = dict(model=model, system=system, tools=tools, messages=messages, max_tokens=1500)
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
-        resp = self.client.messages.create(**kwargs)
+        try:
+            resp = self.client.messages.create(**kwargs)
+        except self._anthropic.APIError as exc:
+            # Bad model id, exhausted retries, etc. — surface as a clean sentinel, don't crash.
+            return LLMResponse(content=[], tool_calls=[], text=f"[api_error] {exc}", stop_reason="error")
         tool_calls, text = [], ""
         for block in resp.content:
             if block.type == "tool_use":
@@ -261,6 +267,11 @@ def diagnose(model_name: str = DIAGNOSE_MODEL, max_steps: int = MAX_STEPS) -> di
         # On the last allowed step, force a conclusion by offering only submit_diagnosis.
         offered = tools if step < max_steps - 1 else [SUBMIT_DIAGNOSIS]
         resp = model.complete(SYSTEM_PROMPT, messages, offered, model_name)
+        if resp.stop_reason == "error":
+            return _report({"incident": True, "root_cause": f"Diagnosis could not complete: {resp.text}",
+                            "recommended_fix": "Retry; verify ANTHROPIC_API_KEY and the model id.",
+                            "confidence": "low", "evidence": [resp.text]},
+                           trace, tokens, step + 1, started, backend, model_name)
         tokens["input"] += resp.usage["input_tokens"]
         tokens["output"] += resp.usage["output_tokens"]
         messages.append({"role": "assistant", "content": resp.content})
