@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
@@ -56,6 +57,30 @@ class _DbConn:
             _db_pool.putconn(self.conn)
 
 
+DEP_REFRESH_INTERVAL = 5  # seconds between background dependency probes
+
+
+def probe_dependencies() -> dict[str, bool]:
+    """Live pg/redis connectivity check; also updates metrics.deps. Shared by
+    /health and the background monitor so /metrics is never stale."""
+    checks: dict[str, bool] = {}
+    try:
+        with _DbConn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        checks["postgres"] = True
+    except Exception:  # noqa: BLE001
+        checks["postgres"] = False
+    try:
+        checks["redis"] = bool(get_redis().ping())
+    except Exception:  # noqa: BLE001
+        checks["redis"] = False
+    for name, up in checks.items():
+        metrics.set_dep(name, up)
+    return checks
+
+
 @app.on_event("startup")
 def startup() -> None:
     for attempt in range(10):
@@ -79,6 +104,21 @@ def startup() -> None:
             time.sleep(1)
 
 
+@app.on_event("startup")
+async def start_dep_monitor() -> None:
+    """Refresh dependency status every few seconds so /metrics stays near-live
+    without a /health probe. Runs the blocking checks off the event loop."""
+    async def loop() -> None:
+        while True:
+            try:
+                await asyncio.to_thread(probe_dependencies)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("dep_monitor_error", extra={"err": str(exc)})
+            await asyncio.sleep(DEP_REFRESH_INTERVAL)
+
+    app.state.dep_monitor = asyncio.create_task(loop())
+
+
 
 class ItemIn(BaseModel):
     name: str
@@ -91,23 +131,7 @@ def root() -> dict:
 
 @app.get("/health")
 def health() -> JSONResponse:
-    checks: dict[str, bool] = {}
-    try:
-        with _DbConn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-        checks["postgres"] = True
-    except Exception:  # noqa: BLE001
-        checks["postgres"] = False
-    try:
-        checks["redis"] = bool(get_redis().ping())
-    except Exception:  # noqa: BLE001
-        checks["redis"] = False
-
-    for name, up in checks.items():
-        metrics.set_dep(name, up)
-
+    checks = probe_dependencies()
     healthy = all(checks.values())
     return JSONResponse(
         status_code=200 if healthy else 503,
