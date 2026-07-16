@@ -17,7 +17,20 @@ from agent.tools import TOOL_SCHEMAS, call_tool
 load_dotenv()
 
 DIAGNOSE_MODEL = os.environ.get("DIAGNOSE_MODEL", "claude-sonnet-4-6")
+TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "claude-haiku-4-5-20251001")
 MAX_STEPS = 8
+
+# Approximate USD per 1M tokens (input, output). Configurable; used to turn token
+# counts into a dollar cost so the triage/diagnose split can be measured.
+PRICING = {"haiku": (1.0, 5.0), "sonnet": (3.0, 15.0), "opus": (15.0, 75.0)}
+
+
+def cost(tokens: dict, model: str) -> float:
+    key = next((k for k in PRICING if k in model), None)
+    if key is None:
+        return 0.0
+    pin, pout = PRICING[key]
+    return round(tokens["input"] / 1e6 * pin + tokens["output"] / 1e6 * pout, 6)
 
 SYSTEM_PROMPT = """You are an SRE diagnostician. A monitoring alert may have fired on a small \
 service and you must find out what (if anything) is wrong.
@@ -49,6 +62,26 @@ SUBMIT_DIAGNOSIS = {
     },
 }
 
+TRIAGE_SYSTEM = """You are the first-line triage for an SRE agent. You get a compact snapshot of a \
+small service (app -> postgres, redis) and must make ONE fast call: is something actually wrong? \
+Do not diagnose the root cause — a stronger agent does that. Only decide whether to escalate. \
+Any service not running, unreachable metrics, elevated error rate, or elevated latency means \
+incident. If unsure, say incident with low confidence. Call triage_verdict."""
+
+TRIAGE_VERDICT = {
+    "name": "triage_verdict",
+    "description": "Your triage decision. Call exactly once.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "incident": {"type": "boolean", "description": "True if the strong agent should investigate."},
+            "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+            "reason": {"type": "string", "description": "One line: what tipped the decision."},
+        },
+        "required": ["incident", "confidence", "reason"],
+    },
+}
+
 
 @dataclass
 class LLMResponse:
@@ -64,10 +97,11 @@ class AnthropicModel:
         import anthropic
         self.client = anthropic.Anthropic()
 
-    def complete(self, system, messages, tools, model) -> LLMResponse:
-        resp = self.client.messages.create(
-            model=model, system=system, tools=tools, messages=messages, max_tokens=1500,
-        )
+    def complete(self, system, messages, tools, model, tool_choice=None) -> LLMResponse:
+        kwargs = dict(model=model, system=system, tools=tools, messages=messages, max_tokens=1500)
+        if tool_choice:
+            kwargs["tool_choice"] = tool_choice
+        resp = self.client.messages.create(**kwargs)
         tool_calls, text = [], ""
         for block in resp.content:
             if block.type == "tool_use":
@@ -88,7 +122,13 @@ class MockModel:
     """
     _n = 0
 
-    def complete(self, system, messages, tools, model) -> LLMResponse:
+    def complete(self, system, messages, tools, model, tool_choice=None) -> LLMResponse:
+        if any(t["name"] == "triage_verdict" for t in tools):
+            verdict = self._triage(self._extract_snapshot(messages))
+            block = {"type": "tool_use", "id": "mock_triage", "name": "triage_verdict", "input": verdict}
+            return LLMResponse(content=[block],
+                               tool_calls=[{"id": "mock_triage", "name": "triage_verdict", "input": verdict}],
+                               stop_reason="tool_use")
         seen_results = any(
             isinstance(m["content"], list)
             and any(b.get("type") == "tool_result" for b in m["content"])
@@ -149,6 +189,34 @@ class MockModel:
         return {"incident": False, "root_cause": "No fault detected; all services healthy.",
                 "recommended_fix": "No action needed.", "confidence": "medium",
                 "evidence": ["all containers running", "error rate near zero"]}
+
+    @staticmethod
+    def _extract_snapshot(messages) -> dict:
+        decoder = json.JSONDecoder()
+        for m in reversed(messages):
+            content = m.get("content")
+            if isinstance(content, str) and "{" in content:
+                try:
+                    obj, _ = decoder.raw_decode(content[content.index("{"):])
+                    return obj
+                except ValueError:
+                    continue
+        return {}
+
+    @staticmethod
+    def _triage(snapshot) -> dict:
+        services = snapshot.get("services", [])
+        metrics = snapshot.get("metrics", {})
+        down = [s["service"] for s in services if not s.get("running", True)]
+        if down:
+            return {"incident": True, "confidence": "high", "reason": f"{', '.join(down)} not running"}
+        if not metrics or metrics.get("reachable") is False:
+            return {"incident": True, "confidence": "high", "reason": "app metrics unreachable"}
+        if metrics.get("error_rate", 0) > 0.2:
+            return {"incident": True, "confidence": "high", "reason": "elevated error rate"}
+        if metrics.get("p99_latency_ms", 0) > 300:
+            return {"incident": True, "confidence": "medium", "reason": "elevated p99 latency"}
+        return {"incident": False, "confidence": "high", "reason": "all services running, metrics nominal"}
 
 
 def _make_model():
@@ -225,6 +293,50 @@ def _report(diag, trace, tokens, steps, started, backend, model_name) -> dict:
             "backend": backend, "model": model_name if backend == "anthropic" else "mock"}
 
 
+# --- triage stage + cascade --------------------------------------------------
+
+def gather_snapshot() -> dict:
+    """Cheap, deterministic snapshot for triage (no model — tools are free)."""
+    svc = call_tool("list_services")
+    met = call_tool("get_metrics")
+    metrics = met.get("metrics") if met.get("ok") else {"reachable": met.get("reachable", False)}
+    return {
+        "services": [{"service": s["service"], "running": s["running"], "status": s["status"]}
+                     for s in svc.get("services", [])],
+        "metrics": metrics,
+    }
+
+
+def triage(model, snapshot, model_name=TRIAGE_MODEL) -> dict:
+    msg = (f"System snapshot (JSON):\n{json.dumps(snapshot)}\n\n"
+           "Decide whether to escalate, then call triage_verdict.")
+    resp = model.complete(TRIAGE_SYSTEM, [{"role": "user", "content": msg}], [TRIAGE_VERDICT],
+                          model_name, tool_choice={"type": "tool", "name": "triage_verdict"})
+    verdict = next((c["input"] for c in resp.tool_calls if c["name"] == "triage_verdict"),
+                   {"incident": True, "confidence": "low", "reason": "no verdict returned; escalating"})
+    tks = {"input": resp.usage["input_tokens"], "output": resp.usage["output_tokens"]}
+    return {**verdict, "tokens": tks, "cost": cost(tks, model_name)}
+
+
+def run_cascade(use_triage: bool = True) -> dict:
+    """Triage (cheap) gates diagnosis (strong). Returns a combined report with costs."""
+    model, backend = _make_model()
+
+    if not use_triage:
+        d = diagnose()
+        dcost = cost(d["tokens"], DIAGNOSE_MODEL)
+        return {"triage": None, "escalated": True, "diagnosis": d, "backend": backend,
+                "cost": {"triage_usd": 0.0, "diagnosis_usd": dcost, "total_usd": dcost}}
+
+    t = triage(model, gather_snapshot())
+    escalate = t["incident"] or t["confidence"] == "low"
+    d = diagnose() if escalate else None
+    dcost = cost(d["tokens"], DIAGNOSE_MODEL) if d else 0.0
+    return {"triage": t, "escalated": escalate, "diagnosis": d, "backend": backend,
+            "cost": {"triage_usd": t["cost"], "diagnosis_usd": dcost,
+                     "total_usd": round(t["cost"] + dcost, 6)}}
+
+
 def _print_report(r: dict) -> None:
     verdict = "INCIDENT" if r["incident"] else "ALL CLEAR"
     print(f"\n=== {verdict}  (confidence: {r['confidence']}) ===")
@@ -239,9 +351,28 @@ def _print_report(r: dict) -> None:
     print(f"\ntokens: in={r['tokens']['input']} out={r['tokens']['output']}  |  {r['elapsed_s']}s")
 
 
+def _print_cascade(c: dict) -> None:
+    t = c["triage"]
+    if t is not None:
+        decision = "ESCALATE" if t["incident"] else "quiet"
+        print(f"\n--- TRIAGE ({decision}, confidence: {t['confidence']}) ---")
+        print(f"reason: {t['reason']}")
+    if c["diagnosis"] is not None:
+        _print_report(c["diagnosis"])
+    elif not c["escalated"]:
+        print("\n=== ALL CLEAR (triage) — diagnosis skipped, expensive loop avoided ===")
+    cst = c["cost"]
+    print(f"\ncost: triage=${cst['triage_usd']:.6f}  diagnosis=${cst['diagnosis_usd']:.6f}  "
+          f"total=${cst['total_usd']:.6f}   [{c['backend']} backend]")
+
+
 def main(argv=None) -> int:
-    r = diagnose()
-    _print_report(r)
+    import argparse
+    parser = argparse.ArgumentParser(prog="agent.diagnose")
+    parser.add_argument("--no-triage", action="store_true",
+                        help="skip triage and run the strong diagnostician directly (Day 4/5 behavior)")
+    args = parser.parse_args(argv)
+    _print_cascade(run_cascade(use_triage=not args.no_triage))
     return 0
 
 
