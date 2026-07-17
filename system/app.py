@@ -27,6 +27,10 @@ app.add_middleware(TelemetryMiddleware)
 _db_pool: pgpool.SimpleConnectionPool | None = None
 _redis: redis.Redis | None = None
 
+# Day-8 fault resources: held pool connections (pool exhaustion) + leaked memory.
+_held_conns: list = []
+_leak_buf: list = []
+
 
 def get_redis() -> redis.Redis:
     global _redis
@@ -175,13 +179,39 @@ def get_item(item_id: int) -> dict:
 class InjectIn(BaseModel):
     latency_ms: int | None = None
     fail_rate: float | None = None
+    hold_db_conns: int | None = None
+    leak_mb: int | None = None
+
+
+def _release_resources() -> None:
+    """Return held pool connections and free leaked memory."""
+    while _held_conns:
+        try:
+            _db_pool.putconn(_held_conns.pop())
+        except Exception:  # noqa: BLE001
+            pass
+    _leak_buf.clear()
+
+
+def _admin_status() -> dict:
+    return {**injected.snapshot(), "held_conns": len(_held_conns),
+            "leaked_mb": sum(len(b) for b in _leak_buf) // 1_048_576}
 
 
 @app.post("/admin/inject")
 def admin_inject(spec: InjectIn) -> dict:
-    """Fault-injection seam: toggle in-process faults the middleware applies."""
+    """Fault-injection seam: toggle in-process faults + resource-level faults."""
     injected.set(latency_ms=spec.latency_ms, fail_rate=spec.fail_rate)
-    state = injected.snapshot()
+    if spec.hold_db_conns:
+        pool = _ensure_pool()
+        for _ in range(spec.hold_db_conns):
+            try:
+                _held_conns.append(pool.getconn())
+            except pgpool.PoolError:
+                break  # pool exhausted — which is exactly the fault
+    if spec.leak_mb:
+        _leak_buf.append(bytearray(spec.leak_mb * 1_048_576))
+    state = _admin_status()
     log.warning("fault_injected", extra=state)
     return state
 
@@ -189,19 +219,21 @@ def admin_inject(spec: InjectIn) -> dict:
 @app.post("/admin/clear")
 def admin_clear() -> dict:
     injected.clear()
+    _release_resources()
     log.warning("fault_cleared")
-    return injected.snapshot()
+    return _admin_status()
 
 
 @app.get("/admin/state")
 def admin_state() -> dict:
-    return injected.snapshot()
+    return _admin_status()
 
 
 @app.post("/admin/reset")
 def admin_reset() -> dict:
     """Clear injected faults + metric windows so a fresh scenario starts clean."""
     injected.clear()
+    _release_resources()
     metrics.reset()
     log.warning("metrics_reset")
     return {"reset": True}
