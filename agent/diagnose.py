@@ -181,6 +181,21 @@ class MockModel:
                 return {"incident": True, "root_cause": f"The {dep} container is down.",
                         "recommended_fix": f"Restart the {dep} container.", "confidence": "high",
                         "evidence": [f"{dep} container status is not 'running'"]}
+        # Container up but the app can't reach it -> connection/pool issue, not an outage.
+        deps = metrics.get("dependencies", {})
+        for dep in ("postgres", "redis"):
+            if by_name.get(dep) and by_name[dep]["running"] and deps.get(dep) is False:
+                return {"incident": True,
+                        "root_cause": f"App cannot get a {dep} connection though the {dep} container is up "
+                                      "(connection pool exhausted).",
+                        "recommended_fix": "Release/raise the connection pool and fix the leak; do not restart the dependency.",
+                        "confidence": "medium",
+                        "evidence": [f"{dep} container running but /health {dep}=false", "'pool exhausted' errors"]}
+        mem = metrics.get("memory_rss_mb", 0)
+        if mem and mem > 250:
+            return {"incident": True, "root_cause": "The app is leaking memory (RSS far above baseline).",
+                    "recommended_fix": "Restart the app to reclaim memory, then fix the leak.",
+                    "confidence": "medium", "evidence": [f"memory_rss_mb {mem} far above ~63MB baseline"]}
         p99 = metrics.get("p99_latency_ms", 0)
         if p99 and p99 > 300 and metrics.get("error_rate", 0) < 0.1:
             return {"incident": True, "root_cause": "Elevated request latency (slow path / injected delay).",
@@ -218,6 +233,10 @@ class MockModel:
             return {"incident": True, "confidence": "high", "reason": f"{', '.join(down)} not running"}
         if not metrics or metrics.get("reachable") is False:
             return {"incident": True, "confidence": "high", "reason": "app metrics unreachable"}
+        if any(v is False for v in metrics.get("dependencies", {}).values()):
+            return {"incident": True, "confidence": "high", "reason": "a dependency is unreachable"}
+        if metrics.get("memory_rss_mb", 0) > 250:
+            return {"incident": True, "confidence": "medium", "reason": "memory usage far above baseline"}
         if metrics.get("error_rate", 0) > 0.2:
             return {"incident": True, "confidence": "high", "reason": "elevated error rate"}
         if metrics.get("p99_latency_ms", 0) > 300:
