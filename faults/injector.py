@@ -37,7 +37,24 @@ def _dispatch(action: dict) -> dict:
         return _admin("/admin/inject", action.get("payload", {}))
     if kind == "admin_clear":
         return _admin("/admin/clear")
+    if kind == "reset":
+        return _admin("/admin/reset")
+    if kind == "noop":
+        return {"noop": True}
     raise ValueError(f"unknown action: {kind}")
+
+
+def generate_load(n: int = 30) -> int:
+    """Fire n cheap requests so request-driven signals (error_rate, load) show up.
+    Reused by benign scenarios' `traffic` hint and the Day-9 eval harness."""
+    ok = 0
+    for _ in range(n):
+        try:
+            requests.get(f"{SYSTEM_BASE_URL}/work", timeout=5)
+            ok += 1
+        except requests.RequestException:
+            pass
+    return ok
 
 
 def cmd_list(scenarios: dict[str, dict]) -> None:
@@ -95,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list")
     sub.add_parser("status")
     sub.add_parser("clear-all")
+    lp = sub.add_parser("load")
+    lp.add_argument("n", nargs="?", type=int, default=30)
     for name in ("inject", "clear"):
         p = sub.add_parser(name)
         p.add_argument("id")
@@ -111,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd_status()
     elif args.cmd == "clear-all":
         cmd_clear_all(scenarios)
+    elif args.cmd == "load":
+        print(f"generated {generate_load(args.n)}/{args.n} requests")
     elif args.cmd == "inject":
         cmd_inject(scenarios, args.id)
     elif args.cmd == "clear":

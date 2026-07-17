@@ -84,3 +84,83 @@
     - dependencies still healthy, latency normal
   inject: {action: admin_inject, payload: {fail_rate: 0.5}}
   clear: {action: admin_clear}
+
+- id: connection_pool_exhaustion
+  name: DB connection pool exhausted
+  type: app
+  benign: false
+  traffic: 20
+  symptom: >-
+    Requests that touch the database return 503 "db pool exhausted"; /health reports
+    postgres:false. But the Postgres container is still running — the app just can't
+    get a connection.
+  root_cause: >-
+    The app's small DB connection pool is fully checked out (a leak / too few
+    connections for the load), so new queries can't acquire a connection. Postgres
+    itself is healthy.
+  correct_fix: >-
+    Release the leaked connections (or raise the pool size) and fix whatever holds
+    connections open. Do NOT restart Postgres — it is not the problem.
+  detect_signals:
+    - postgres CONTAINER is running (not exited)
+    - /items returns 503 with "db pool exhausted"
+    - /health checks.postgres == false despite the container being up
+  inject: {action: admin_inject, payload: {hold_db_conns: 5}}
+  clear: {action: admin_clear}
+
+- id: memory_leak
+  name: App memory growth
+  type: app
+  benign: false
+  symptom: >-
+    The app's memory_rss_mb climbs far above its ~63MB baseline and keeps growing;
+    left unchecked it would OOM and restart. Dependencies and error rate look normal.
+  root_cause: The app is leaking memory (unbounded allocation not being freed).
+  correct_fix: Restart the app to reclaim memory, then find and fix the leak in code.
+  detect_signals:
+    - /metrics memory_rss_mb far above baseline
+    - dependencies healthy, error_rate and latency normal
+  inject: {action: admin_inject, payload: {leak_mb: 300}}
+  clear: {action: admin_clear}
+
+- id: benign_healthy
+  name: Steady state (no incident)
+  type: benign
+  benign: true
+  symptom: All services healthy, metrics nominal. Nothing is wrong.
+  root_cause: No fault — the system is operating normally.
+  correct_fix: No action needed.
+  detect_signals:
+    - all containers running, error_rate ~0, latency nominal
+  inject: {action: reset}
+  clear: {action: noop}
+
+- id: benign_load_spike
+  name: Normal load spike (no incident)
+  type: benign
+  benign: true
+  traffic: 60
+  symptom: >-
+    Request volume rises sharply but all requests succeed quickly; error_rate stays
+    ~0 and latency stays nominal. Just more traffic, not a fault.
+  root_cause: No fault — a benign increase in traffic the system handles fine.
+  correct_fix: No action needed (scale only if this becomes sustained).
+  detect_signals:
+    - elevated request_count, error_rate ~0, latency nominal, deps healthy
+  inject: {action: reset}
+  clear: {action: noop}
+
+- id: benign_minor_errors
+  name: Minor transient errors (no incident)
+  type: benign
+  benign: true
+  traffic: 40
+  symptom: >-
+    A small fraction of requests fail (~5%), within normal noise. error_rate is low
+    and dependencies are healthy — not worth paging on.
+  root_cause: No real incident — a low, tolerable rate of transient errors.
+  correct_fix: No action needed; keep monitoring.
+  detect_signals:
+    - error_rate low (well under alarm threshold), deps healthy
+  inject: {action: admin_inject, payload: {fail_rate: 0.05}}
+  clear: {action: admin_clear}
