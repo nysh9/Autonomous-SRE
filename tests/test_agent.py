@@ -3,7 +3,7 @@ import agent.tools as tools
 from agent.diagnose import MockModel, cost, triage
 from faults.injector import load_scenarios
 
-KNOWN_ACTIONS = {"stop_container", "start_container", "admin_inject", "admin_clear"}
+KNOWN_ACTIONS = {"stop_container", "start_container", "admin_inject", "admin_clear", "reset", "noop"}
 
 
 def _healthy_snapshot(**metrics):
@@ -40,6 +40,19 @@ def test_triage_escalates_on_high_error_rate():
 
 def test_triage_escalates_on_high_latency():
     assert triage(MockModel(), _healthy_snapshot(p99_latency_ms=850))["incident"] is True
+
+
+def test_triage_escalates_on_high_memory():
+    assert triage(MockModel(), _healthy_snapshot(memory_rss_mb=400))["incident"] is True
+
+
+def test_triage_escalates_when_dependency_unreachable():
+    snap = _healthy_snapshot(dependencies={"postgres": False, "redis": True})
+    assert triage(MockModel(), snap)["incident"] is True
+
+
+def test_triage_quiet_on_minor_errors():
+    assert triage(MockModel(), _healthy_snapshot(error_rate=0.05))["incident"] is False
 
 
 def test_get_metrics_structured_error_when_app_down(monkeypatch):
