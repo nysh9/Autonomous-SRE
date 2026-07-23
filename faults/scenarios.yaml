@@ -46,6 +46,7 @@
   detect_signals:
     - /metrics p99_latency_ms far above baseline
     - dependencies still healthy, error_rate near zero
+  traffic: 10
   inject: {action: admin_inject, payload: {latency_ms: 800}}
   clear: {action: admin_clear}
 
@@ -82,6 +83,7 @@
   detect_signals:
     - /metrics error_rate well above baseline
     - dependencies still healthy, latency normal
+  traffic: 30
   inject: {action: admin_inject, payload: {fail_rate: 0.5}}
   clear: {action: admin_clear}
 
@@ -90,6 +92,7 @@
   type: app
   benign: false
   traffic: 20
+  settle: 6
   symptom: >-
     Requests that touch the database return 503 "db pool exhausted"; /health reports
     postgres:false. But the Postgres container is still running — the app just can't
